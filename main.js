@@ -1,5 +1,5 @@
 /**
- * main.js - 红果短剧 6.1 下载器（独立版）主进程
+ * main.js - 红果短剧 6.2 下载器（独立版）主进程
  *
  * 功能：
  *   1. 红果短剧解析（分享链接 / series_id -> 全剧集列表）
@@ -1097,15 +1097,15 @@ async function executeHongguoDownload(task) {
         try {
           if (playInfo.codec === 'bytevc2') {
             const notice = task.qualityNotice;
-            const progress = seconds => {
+            const progress = (seconds, phase = 'transcoding') => {
               task.progress = Math.min(99, Math.floor(seconds / playInfo.duration * 100));
-              task.qualityNotice = '正在转换为可播放格式';
+              task.qualityNotice = phase === 'queued' ? '等待其他视频转换完成' : '正在转换为可播放格式';
               sendToRenderer('download-progress', { id, progress: task.progress, qualityNotice: task.qualityNotice });
             };
-            progress(0);
             try {
               await convertBytevc2({ executable: resolveFfmpeg('librempeg'), input: tmpPath, output: decodedPath,
-                contentKey: playInfo.contentKey, duration: playInfo.duration, cancelToken: source.token, onProgress: progress });
+                contentKey: playInfo.contentKey, duration: playInfo.duration, cancelToken: source.token, onProgress: progress,
+                onPhase: phase => progress(0, phase) });
             } finally { task.qualityNotice = notice || ''; }
           } else await decryptContentKeyFile(tmpPath, decodedPath, playInfo.contentKey, { cancelToken: source.token });
           task.actualQuality = await verifyReceived(decodedPath);
@@ -3101,9 +3101,9 @@ async function fetchDecryptedEpisodeOnce(vid, onProgress, seriesId, playInfo, si
       await pipeline(response.data, fs.createWriteStream(input, { mode: 0o600 }), { signal });
       if (!received || (total && received !== total)) throw mediaTransferError('视频下载不完整，请重试');
       if (playInfo.codec === 'bytevc2') {
-        onProgress?.(0, received, 'transcoding');
         await convertBytevc2({ executable: resolveFfmpeg('librempeg'), input, output,
           contentKey: playInfo.contentKey, duration: playInfo.duration, signal, maxBytes,
+          onPhase: phase => onProgress?.(0, received, phase),
           getPriority: () => [...onlineSessions.values()].some(session => session.vid === String(vid) && !session.prefetch) ? 2 : 1,
           onProgress: seconds => onProgress?.(Math.floor(received * Math.min(1, seconds / playInfo.duration)), received, 'transcoding') });
       } else {
@@ -3174,9 +3174,9 @@ ipcMain.handle('prepare-online-play', async (event, payload) => {
         job = { controller, force };
         job.promise = trackOnlineWork(controller, (async () => {
           const progress = (received,total,phase) => {
+            job.progress = { received, total, percent: total ? Math.floor(received / total * 100) : 0, phase: phase || 'downloading' };
             for (const active of onlineSessions.values()) if (active.cacheKey === key) {
-              sendToRenderer('online-play-progress',{vid:sourceVid,seriesId,vidIndex,requestId:active.requestId,
-                received,total,percent:total?Math.floor(received/total*100):0,phase:phase||'downloading'});
+              sendToRenderer('online-play-progress',{vid:sourceVid,seriesId,vidIndex,requestId:active.requestId, ...job.progress});
             }
           };
           const prepared = await withMediaRecovery(sourceVid,seriesId,{playInfo:checkedPlayInfo,quality,force,signal:controller.signal},async playInfo => {
@@ -3200,6 +3200,7 @@ ipcMain.handle('prepare-online-play', async (event, payload) => {
         onlinePreparing.set(key, job);
       }
       session.job = job;
+      if (job.progress) sendToRenderer('online-play-progress', { vid: sourceVid, seriesId, vidIndex, requestId, ...job.progress });
       entry = await job.promise;
     }
     if (!onlineSessions.has(streamId)) throw new Error('已取消播放');
@@ -3215,7 +3216,11 @@ ipcMain.handle('prepare-online-play', async (event, payload) => {
 
 ipcMain.handle('promote-online-play', (event, payload = {}) => {
   for (const session of onlineSessions.values()) {
-    if (payload.requestId && session.requestId === payload.requestId) session.prefetch = false;
+    if (payload.requestId && session.requestId === payload.requestId) {
+      session.prefetch = false;
+      if (session.job?.progress) sendToRenderer('online-play-progress', { vid: session.vid, seriesId: session.seriesId,
+        vidIndex: session.vidIndex, requestId: session.requestId, ...session.job.progress });
+    }
   }
   return { success: true };
 });
@@ -4212,9 +4217,12 @@ async function checkHistoryRow(row, context) {
       if (!currentSeries) return { status: 'skipped' };
       const previousRecord = map[sid];
       const next = watchHistory.applyEpisodeUpdate(previousRecord, currentSeries, fresh);
+      // A higher season may have been watched while either network request was pending.
+      const latestSeason = sequelResponse ? historyFamilyRows(watchHistory.listHistory(seriesRegistry, map, false), currentSeries)
+        .reduce((latest, item) => Math.max(latest, item.season), 0) : 0;
       if (sequelResponse) {
-        const candidates = watchHistory.findSequels(currentSeries, sequelResponse.candidates || sequelResponse.results || []);
-        const combined = new Map((previousRecord.sequels || []).map(item => [item.series_id, item]));
+        const candidates = watchHistory.findSequels(currentSeries, sequelResponse.candidates || sequelResponse.results || [], latestSeason);
+        const combined = new Map(watchHistory.findSequels(currentSeries, previousRecord.sequels || [], latestSeason).map(item => [item.series_id, item]));
         for (const item of candidates) combined.set(item.series_id, item);
         next.sequels = [...combined.values()].slice(-20);
         next.similarSeries = watchHistory.findSimilarSeries(currentSeries,
@@ -4226,7 +4234,7 @@ async function checkHistoryRow(row, context) {
       const newEpisodes = next.knownTotal > (previousRecord.knownTotal ?? currentSeries.total ?? currentSeries.episodes?.length ?? 0);
       const knownSequels = new Set((previousRecord.sequels || []).map(item => item.series_id));
       const rowCandidates = sequelResponse
-        ? watchHistory.findSequels(currentSeries, sequelResponse.candidates || sequelResponse.results || [])
+        ? watchHistory.findSequels(currentSeries, sequelResponse.candidates || sequelResponse.results || [], latestSeason)
         : [];
       const newSequel = sequelResponse?.success === true && rowCandidates.some(item => !knownSequels.has(item.series_id));
       if (fresh.episodes.length >= (currentSeries.episodes?.length || 0)) {
