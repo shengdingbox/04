@@ -21,11 +21,21 @@ async function setup() {
   await Promise.all(Object.entries(manifest.files).map(async ([name, sha256]) => {
     const target = path.join(output, name);
     if (fs.existsSync(target) && digest(fs.readFileSync(target)) === sha256) return;
-    const response = await fetch(`https://raw.githubusercontent.com/zhaohappy/libmedia/${manifest.commit}/dist/${name}`,
-      { signal: AbortSignal.timeout(60000) });
-    if (!response.ok) throw new Error(`软件解码资源下载失败：${name} HTTP ${response.status}`);
-    const bytes = Buffer.from(await response.arrayBuffer());
-    if (digest(bytes) !== sha256) throw new Error(`软件解码资源SHA256不符：${name}`);
+    const raw = `https://raw.githubusercontent.com/zhaohappy/libmedia/${manifest.commit}/dist/${name}`;
+    // raw.githubusercontent.com 直连常失败，逐个镜像回退（内容有 SHA256 校验，镜像调包会被拦下）。
+    const urls = [raw, ...['https://gh-proxy.com/', 'https://ghproxy.net/', 'https://mirror.ghproxy.com/'].map(prefix => prefix + raw)];
+    let bytes = null, lastError = null;
+    for (const url of urls) {
+      try {
+        const response = await fetch(url, { signal: AbortSignal.timeout(60000) });
+        if (!response.ok) { lastError = new Error(`软件解码资源下载失败：${name} HTTP ${response.status}`); continue; }
+        const candidate = Buffer.from(await response.arrayBuffer());
+        if (digest(candidate) !== sha256) { lastError = new Error(`软件解码资源SHA256不符：${name}`); continue; }
+        bytes = candidate;
+        break;
+      } catch (error) { lastError = error; }
+    }
+    if (!bytes) throw lastError || new Error(`软件解码资源下载失败：${name}`);
     fs.mkdirSync(path.dirname(target), { recursive: true });
     fs.writeFileSync(target, bytes);
   }));
