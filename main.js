@@ -65,6 +65,7 @@ const mediaAccess = require('./src/native/media-access').createMediaAccess(proce
 const rendererSecurity = require('./src/native/renderer-security').createRendererSecurity(
   path.join(__dirname, 'dist-react', 'index.html'), process.env.VITE_DEV_SERVER_URL);
 const attachFloatingPlayerWindow = require('./src/native/floating-player-window');
+const license = require('./src/native/license');
 const APP_VERSION = app.getVersion() || '1.0.0';
 
 const APP_TITLE = IS_PREVIEW ? '红果短剧预览' : '红果短剧';
@@ -2632,6 +2633,10 @@ function navigateToPlayer(payload) {
  * 主进程只负责发导航指令，具体的剧集状态由渲染层拉取，避免重复维护一份数据。
  */
 ipcMain.handle('play-series', async (event, payload) => {
+  if (!license.isActivated()) {
+    sendToRenderer('license-required', { scene: 'play-series' });
+    return { success: false, code: license.LICENSE_REQUIRED, error: '播放需要先激活授权，请先完成软件激活' };
+  }
   const { seriesId, vidIndex } = payload || {};
   const entry = seriesRegistry.find(item => String(item.series_id) === String(seriesId));
   if (!entry) return { success: false, code: 'SERIES_NOT_FOUND', error: '未找到短剧档案，请重新打开详情' };
@@ -3144,6 +3149,10 @@ async function prepareHlsEntry(playInfo,entry,signal,onProgress) {
 }
 
 ipcMain.handle('prepare-online-play', async (event, payload) => {
+  if (!license.isActivated() && payload?.prefetch !== true) {
+    sendToRenderer('license-required', { scene: 'prepare-online-play' });
+    return { success: false, code: license.LICENSE_REQUIRED, error: '播放需要先激活授权，请先完成软件激活' };
+  }
   const { vid, seriesId, vidIndex, requestId, prefetch = false, force = false } = payload || {};
   if (!vid) return { success: false, error: '缺少 vid' };
   let quality;
@@ -5294,6 +5303,10 @@ ipcMain.handle('set-window-layout', async (event, mode) => {
   } finally { layoutChanging = false; }
 });
 
+// ===== 激活授权 =====
+ipcMain.handle('license-get-status', async () => license.getStatus());
+ipcMain.handle('license-activate', async (_event, code) => license.activate(String(code || '')));
+
 // ===== 窗口创建 =====
 function createWindow() {
   windowLayout = 'landscape';
@@ -5397,6 +5410,7 @@ if (hasSingleInstanceLock) app.whenReady().then(async () => {
   try {
     const dataFile = path.join(app.getPath('userData'), 'data.json');
     store.init(dataFile, { safeStorage });
+    license.init(app.getPath('userData'));
     setDeviceIdentityFile(path.join(app.getPath('userData'), 'danmaku-client.json'));
     loadDownloadTasks();
     loadSeriesRegistry();

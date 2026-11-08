@@ -16,6 +16,8 @@ import AnnouncementNotice from './components/AnnouncementNotice';
 import DramaFeed from './components/DramaFeed';
 import ReleaseCalendar from './components/ReleaseCalendar';
 import AccountManagement from './components/AccountManagement';
+import ActivationDialog from './components/ActivationDialog';
+import { loadLicenseStatus, bindLicenseRequired } from './activation.mjs';
 
 const MENU = [
   { id: 'browse', label: '发现短剧', icon: Home },
@@ -47,6 +49,8 @@ export default function App() {
   const [calendarOpening, setCalendarOpening] = useState('');
   const [visited, setVisited] = useState(['browse']);
   const [storageError, setStorageError] = useState('');
+  const [activationOpen, setActivationOpen] = useState(false);
+  const [activationReason, setActivationReason] = useState('');
   const [appInfo, setAppInfo] = useState(null); // { version, brand, appName }
   const [playerMounted, setPlayerMounted] = useState(false);
   const floatingPlayer = useRef(false);
@@ -62,6 +66,14 @@ export default function App() {
     window.electronAPI.getAlwaysOnTop?.().then(setAlwaysOnTop);
     window.electronAPI.getAppInfo().then((info) => {
       setAppInfo(info);
+    });
+    // 启动即弹激活窗（可取消；播放时主进程会再次强制拦截）
+    void loadLicenseStatus().then((status) => {
+      if (!status?.activated) { setActivationReason(''); setActivationOpen(true); }
+    });
+    return bindLicenseRequired(() => {
+      setActivationReason('播放需要先激活授权，请先完成软件激活。');
+      setActivationOpen(true);
     });
   }, []);
 
@@ -234,6 +246,7 @@ export default function App() {
         {storageError && <div className="app-storage-error" role="alert"><span>{storageError}</span><button className="btn btn-outline btn-sm" onClick={() => setStorageError('')}>关闭提示</button></div>}
         {visited.map((id) => <main className="main-content" data-page={id} hidden={page !== id} key={id}>{renderPage(id)}</main>)}
       </div>
+      <ActivationDialog open={activationOpen} reason={activationReason} onClose={() => setActivationOpen(false)} />
     </div>
   );
 }

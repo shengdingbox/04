@@ -2,6 +2,14 @@
 const { contextBridge, ipcRenderer } = require('electron');
 
 contextBridge.exposeInMainWorld('electronAPI', {
+  // 激活授权
+  getLicenseStatus: () => ipcRenderer.invoke('license-get-status'),
+  activateLicense: (code) => ipcRenderer.invoke('license-activate', code),
+  onLicenseRequired: cb => {
+    const listener = (_e, data) => cb(data);
+    ipcRenderer.on('license-required', listener);
+    return () => ipcRenderer.removeListener('license-required', listener);
+  },
   getPublicDetails: (seriesId, vid) => ipcRenderer.invoke('get-public-details', seriesId, vid),
   getEpisodeComments: options => ipcRenderer.invoke('get-episode-comments', options),
   getEpisodeDanmaku: options => ipcRenderer.invoke('get-episode-danmaku', options),
