@@ -1,0 +1,111 @@
+# 红果短剧：macOS Apple Silicon + Intel 双架构候选包（手动触发）。
+# ffmpeg / librempeg 从钉住的源码在各架构 runner 上构建，产物打进 dmg + zip。
+name: macOS arm64+x64 release candidate
+on:
+  workflow_dispatch:
+    inputs:
+      skip_playback:
+        description: Skip player playback when the required acceptance footage is unavailable
+        type: boolean
+        default: false
+      build_only:
+        description: Build release assets without running unit or acceptance checks
+        type: boolean
+        default: false
+permissions:
+  contents: read
+jobs:
+  media:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: arm64
+            runner: macos-14
+          - arch: x64
+            runner: macos-15-intel
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/cache@v4
+        id: media-cache
+        with:
+          path: ~/media-artifacts
+          key: mac-media-${{ matrix.arch }}-${{ hashFiles('scripts/build-ffmpeg-source-mac-x64.sh', 'scripts/build-ffmpeg-source-mac.sh', 'scripts/build-librempeg-source.sh') }}
+      - if: steps.media-cache.outputs.cache-hit != 'true'
+        run: |
+          mkdir -p "$HOME/media-artifacts"
+          case '${{ matrix.arch }}' in
+            arm64) bash scripts/build-ffmpeg-source-mac.sh "$HOME/media-artifacts/ffmpeg" 4 ;;
+            x64)   bash scripts/build-ffmpeg-source-mac-x64.sh  "$HOME/media-artifacts/ffmpeg" 4 ;;
+          esac
+          bash scripts/build-librempeg-source.sh "$HOME/media-artifacts/librempeg" ${{ matrix.arch }} 4
+          mkdir -p "$HOME/media-artifacts/bin"
+          cp "$HOME/media-artifacts/ffmpeg/artifacts/bin/"* "$HOME/media-artifacts/bin/" 2>/dev/null || true
+          cp "$HOME/media-artifacts/librempeg/artifacts/bin/"* "$HOME/media-artifacts/bin/" 2>/dev/null || true
+      - uses: actions/upload-artifact@v4
+        with:
+          name: mac-media-${{ matrix.arch }}
+          path: ~/media-artifacts/bin/
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: mac-media-${{ matrix.arch }}-errors
+          path: |
+            ~/media-artifacts/ffmpeg/logs/
+            ~/media-artifacts/librempeg/logs/
+
+  macos:
+    needs: media
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: arm64
+            runner: macos-14
+          - arch: x64
+            runner: macos-15-intel
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+      - run: npm ci --no-audit --no-fund
+      - uses: actions/download-artifact@v4
+        with:
+          name: mac-media-${{ matrix.arch }}
+          path: media
+      - name: Prepare bundled FFmpeg before tests
+        run: |
+          mkdir -p "build/ffmpeg/darwin-${{ matrix.arch }}"
+          cp media/* "build/ffmpeg/darwin-${{ matrix.arch }}/"
+          chmod +x build/ffmpeg/darwin-${{ matrix.arch }}/ffmpeg build/ffmpeg/darwin-${{ matrix.arch }}/ffprobe build/ffmpeg/darwin-${{ matrix.arch }}/librempeg
+      - name: Verify the ByteVC2 helper starts on this arch
+        run: |
+          decoders="$(build/ffmpeg/darwin-${{ matrix.arch }}/librempeg -hide_banner -decoders 2>&1 || true)"
+          echo "$decoders" | grep -Eq '^[[:space:]]*V[^[:space:]]*[[:space:]]+bvc2[[:space:]]' || { echo "$decoders" | head -20; exit 1; }
+          echo "PASS macOS ${{ matrix.arch }} ByteVC2 helper starts and exposes bvc2 decoder"
+      - name: Run unit checks
+        if: ${{ !inputs.build_only }}
+        run: npm test
+      - name: Build dmg + zip for ${{ matrix.arch }}
+        env:
+          CSC_IDENTITY_AUTO_DISCOVERY: 'false'
+        run: |
+          npx electron-builder --mac dmg zip --${{ matrix.arch }} --publish never
+      - name: Assemble macOS release assets
+        run: |
+          version=$(node -p "require('./package.json').version.replace(/^(\d+\.\d+)\.0$/,'\$1')")
+          mkdir -p dist/mac-release
+          cp dist/*.dmg dist/*.zip dist/mac-release/ 2>/dev/null || true
+          cp dist/latest-mac.yml dist/mac-release/ 2>/dev/null || true
+          cp media/*corresponding-source.tar.gz dist/mac-release/ 2>/dev/null || true
+          cd dist/mac-release && shasum -a 256 * > MACOS-SHA256SUMS-${{ matrix.arch }}.txt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: mac-release-${{ matrix.arch }}
+          path: dist/mac-release/
