@@ -6,8 +6,9 @@ const path = require('node:path');
 const cp = require('node:child_process');
 const { EventEmitter } = require('node:events');
 const { PassThrough } = require('node:stream');
+const vm = require('node:vm');
 
-function fixture(t, { code = 0, seconds = 60, wait = false } = {}) {
+function fixture(t, { code = 0, seconds = 60, wait = false, hardware = false, codes = [], errors = [], outputBytes = [] } = {}) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'hg-bytevc2-'));
   const input = path.join(root, 'input'), output = path.join(root, 'output');
   fs.writeFileSync(input, 'synthetic process fixture, never played');
@@ -17,23 +18,96 @@ function fixture(t, { code = 0, seconds = 60, wait = false } = {}) {
     calls.push({ exe, args, options });
     const child = new EventEmitter();
     children.push(child);
+    const index = children.length - 1;
     child.stdout = new PassThrough(); child.stderr = new PassThrough();
     child.kill = signal => { kills.push(signal); queueMicrotask(() => child.emit('close', null)); return true; };
     queueMicrotask(() => {
-      fs.writeFileSync(args.at(-1), 'process output');
-      child.stderr.write('PRIVATE_KEY_AND_PATH_SENTINEL');
+      fs.writeFileSync(args.at(-1), outputBytes[index] ? Buffer.alloc(outputBytes[index]) : 'process output');
+      child.stderr.write(errors[index] || 'PRIVATE_KEY_AND_PATH_SENTINEL');
       if (!wait) {
         child.stdout.write(`out_time_us=${seconds * 1000000}\nprogress=end\n`);
-        child.emit('close', code);
+        child.emit('close', codes[index] ?? code);
       }
     });
     return child;
   });
+  const module = { exports: {} };
+  vm.runInNewContext(fs.readFileSync(path.join(__dirname, 'bytevc2.js'), 'utf8'), {
+    module, require, process: { platform: hardware ? 'darwin' : 'linux', arch: hardware ? 'arm64' : 'x64' },
+    setTimeout, clearTimeout,
+  });
   return { input, output, calls, kills, children, finish: (index, code = 0) => {
     children[index].stdout.write('out_time_us=60000000\nprogress=end\n');
     children[index].emit('close', code);
-  }, run: extra => require('./bytevc2').convertBytevc2({ executable: '/fixture/librempeg', input, output, duration: 60, ...extra }) };
+  }, run: extra => module.exports.convertBytevc2({ executable: '/fixture/librempeg', input, output, duration: 60, ...extra }) };
 }
+
+test('arm64 Mac uses calibrated hardware H264 encoding without changing dimensions or audio', async t => {
+  const f = fixture(t, { hardware: true });
+  const result = await f.run();
+  const args = f.calls[0].args;
+  assert.equal(args[args.indexOf('-c:v') + 1], 'h264_videotoolbox');
+  assert.equal(args[args.indexOf('-allow_sw') + 1], '0');
+  assert.equal(args[args.indexOf('-realtime') + 1], '0');
+  assert.equal(args[args.indexOf('-q:v') + 1], '68');
+  assert.equal(args[args.indexOf('-profile:v') + 1], 'high');
+  assert.equal(args[args.indexOf('-c:a') + 1], 'copy');
+  assert.equal(args[args.indexOf('-threads:v') + 1], '2');
+  assert.equal(args.includes('-vf'), false);
+  assert.equal(args.includes('-r'), false);
+  assert.equal(args.includes('-crf'), false);
+  assert.equal(result.encoder, 'h264_videotoolbox');
+});
+
+test('hardware encoder initialization failure retries original software encoding once', async t => {
+  const f = fixture(t, { hardware: true, codes: [1, 0], errors: ['[h264_videotoolbox] cannot create compression session', ''] });
+  const result = await f.run();
+  assert.equal(f.calls.length, 2);
+  const args = f.calls[1].args;
+  assert.equal(args[args.indexOf('-c:v') + 1], 'libx264');
+  assert.equal(args[args.indexOf('-preset') + 1], 'veryfast');
+  assert.equal(args[args.indexOf('-crf') + 1], '23');
+  assert.equal(result.encoder, 'libx264');
+});
+
+for (const message of ['No space left on device', 'Permission denied', 'Input/output error', 'Invalid data found when processing input']) {
+  test(`hardware attempt never retries terminal input or storage failure: ${message}`, async t => {
+    const f = fixture(t, { hardware: true, code: 1, errors: [`[h264_videotoolbox] ${message}`] });
+    await assert.rejects(f.run(), error => error.code === 'BYTEVC2_CONVERSION_FAILED' && !error.message.includes('PRIVATE_KEY'));
+    assert.equal(f.calls.length, 1);
+    assert.equal(fs.existsSync(f.output), false);
+  });
+}
+
+test('hardware output hitting the existing byte limit gets one bounded software fallback', async t => {
+  const f = fixture(t, { hardware: true, outputBytes: [20, 10] });
+  const result = await f.run({ maxBytes: 15 });
+  assert.equal(result.encoder, 'libx264');
+  assert.equal(result.size, 10);
+  assert.equal(f.calls.length, 2);
+});
+
+for (const tooLarge of [false, true]) test(`both encoders failing cleans output and releases the queue (${tooLarge ? 'byte limit' : 'encoder error'})`, async t => {
+  const f = fixture(t, { hardware: true, codes: tooLarge ? [] : [1, 1, 0],
+    errors: ['[h264_videotoolbox] cannot create compression session'], outputBytes: tooLarge ? [20, 20, 10] : [] });
+  await assert.rejects(f.run(tooLarge ? { maxBytes: 15 } : {}),
+    error => error.code === (tooLarge ? 'MEDIA_TOO_LARGE' : 'BYTEVC2_CONVERSION_FAILED'));
+  assert.equal(f.calls.length, 2, 'no third encoding attempt');
+  assert.equal(fs.existsSync(f.output), false);
+  const next = await f.run({ output: f.output + '-next' });
+  assert.equal(next.encoder, 'h264_videotoolbox');
+  assert.equal(f.calls.length, 3, 'the next episode can start');
+});
+
+test('canceling hardware conversion does not start the software retry', async t => {
+  const f = fixture(t, { hardware: true, wait: true }), controller = new AbortController();
+  const run = f.run({ signal: controller.signal });
+  while (!f.calls.length) await new Promise(resolve => setImmediate(resolve));
+  controller.abort();
+  await assert.rejects(run, error => error.code === 'ERR_CANCELED');
+  assert.equal(f.calls.length, 1);
+  assert.equal(fs.existsSync(f.output), false);
+});
 
 test('ByteVC2 converts to H.264, copies audio and never exposes native diagnostics', async t => {
   const f = fixture(t), progress = [];
@@ -145,6 +219,71 @@ test('conversion never overwrites an existing output', async t => {
   const f = fixture(t); fs.writeFileSync(f.output, 'keep');
   await assert.rejects(f.run(), error => error.code === 'EEXIST');
   assert.equal(fs.readFileSync(f.output, 'utf8'), 'keep'); assert.equal(f.calls.length, 0);
+});
+
+test('output reservation reports ownership before writing and cleans a failed close', async t => {
+  const f = fixture(t), promises = require('node:fs/promises'), open = promises.open;
+  let identity;
+  mock.method(promises, 'open', async (...args) => {
+    const file = await open(...args);
+    return { stat: () => file.stat(), close: async () => {
+      await file.close(); throw Object.assign(new Error('fixture close failure'), { code: 'EIO' });
+    } };
+  });
+  await assert.rejects(f.run({ onOutputCreated: stat => { identity = stat; } }), error => error.code === 'EIO');
+  assert.ok(identity?.isFile(), 'the exclusive creation must establish cleanup ownership');
+  assert.equal(fs.existsSync(f.output), false, 'failed close must not leave an owned reservation');
+  assert.equal(f.calls.length, 0);
+});
+
+test('failed conversion preserves an output replaced by an unrelated file', async t => {
+  const f = fixture(t, { wait: true });
+  const pending = f.run();
+  const rejected = assert.rejects(pending, error => error.code === 'BYTEVC2_CONVERSION_FAILED');
+  while (!f.calls.length) await new Promise(resolve => setImmediate(resolve));
+  fs.renameSync(f.output, f.output + '-original');
+  fs.writeFileSync(f.output, 'unrelated replacement');
+  f.finish(0, 9); await rejected;
+  assert.equal(fs.readFileSync(f.output, 'utf8'), 'unrelated replacement');
+});
+
+test('an unavailable file identity never authorizes deleting a replaced output', async t => {
+  const f = fixture(t, { wait: true }), promises = require('node:fs/promises');
+  const open = promises.open, lstat = promises.lstat;
+  const unknown = stat => Object.assign(Object.create(Object.getPrototypeOf(stat)), stat, { ino: 0, birthtimeMs: 0 });
+  mock.method(promises, 'open', async (...args) => {
+    const file = await open(...args);
+    return { stat: async () => unknown(await file.stat()), close: () => file.close() };
+  });
+  mock.method(promises, 'lstat', async file => unknown(await lstat(file)));
+  const pending = f.run(), rejected = assert.rejects(pending, error => error.code === 'BYTEVC2_CONVERSION_FAILED');
+  while (!f.calls.length) await new Promise(resolve => setImmediate(resolve));
+  fs.renameSync(f.output, f.output + '-original'); fs.writeFileSync(f.output, 'keep unknown identity');
+  f.finish(0, 9); await rejected;
+  assert.equal(fs.readFileSync(f.output, 'utf8'), 'keep unknown identity');
+});
+
+test('successful conversion cannot publish an unrelated replacement output', async t => {
+  const f = fixture(t, { wait: true });
+  const pending = f.run(), rejected = assert.rejects(pending, error => error.code === 'EEXIST');
+  while (!f.calls.length) await new Promise(resolve => setImmediate(resolve));
+  fs.renameSync(f.output, f.output + '-original'); fs.writeFileSync(f.output, 'keep replacement');
+  f.finish(0); await rejected;
+  assert.equal(fs.readFileSync(f.output, 'utf8'), 'keep replacement');
+});
+
+test('hardware fallback cannot truncate an unrelated replacement output', async t => {
+  const f = fixture(t, { hardware: true, wait: true });
+  let settled = false;
+  const result = f.run().then(() => null, error => error).finally(() => { settled = true; });
+  while (!f.calls.length) await new Promise(resolve => setImmediate(resolve));
+  fs.renameSync(f.output, f.output + '-original'); fs.writeFileSync(f.output, 'keep fallback replacement');
+  f.children[0].stderr.write('[h264_videotoolbox] cannot create compression session');
+  f.finish(0, 1);
+  for (let i = 0; i < 50 && !settled && f.calls.length < 2; i++) await new Promise(resolve => setImmediate(resolve));
+  if (f.calls.length > 1) f.finish(1, 9);
+  assert.equal((await result)?.code, 'EEXIST'); assert.equal(f.calls.length, 1);
+  assert.equal(fs.readFileSync(f.output, 'utf8'), 'keep fallback replacement');
 });
 
 test('native failure removes only the partial output and hides diagnostics', async t => {

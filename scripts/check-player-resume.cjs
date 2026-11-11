@@ -1,4 +1,5 @@
 // Run: node scripts/check-player-resume.cjs [name-filter]. In-memory media only; no playback/network/files.
+const i18nStub = { t: require('../src/i18n/translator.mjs').formatMessage, useLanguage() {}, getLanguage: () => 'zh-CN' };
 const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const vm = require('node:vm');
@@ -78,7 +79,7 @@ function mount({ local = false, localIndexes = [], localQuality, saved = null, t
     clearOnlineCache: async () => ({ success: true }),
     ...apiOverrides,
   };
-  const window = { localStorage: { getItem: key => storage.get(key) ?? null, setItem: (key, value) => storage.set(key, value) }, electronAPI: new Proxy(api, { get: (o, k) => o[k] || (k.startsWith('on') ? () => () => {} : async () => ({})) }),
+  const window = { localStorage: { getItem: key => storage.get(key) ?? null, setItem: (key, value) => storage.set(key, value) }, electronAPI: new Proxy(api, { get: (o, k) => k === 'enterNativePictureInPicture' ? o[k] : o[k] || (k.startsWith('on') ? () => () => {} : async () => ({})) }),
     addEventListener: (k, f, options) => { events.set(k, f); listenerOptions.set(k, options); },
     removeEventListener: k => { events.delete(k); listenerOptions.delete(k); },
     dispatchEvent: event => { events.get(event.type)?.(event); return !event.defaultPrevented; } };
@@ -87,7 +88,7 @@ function mount({ local = false, localIndexes = [], localQuality, saved = null, t
   const shortcutModule = { exports: {} };
   vm.runInNewContext(shortcutSource, { module: shortcutModule, exports: shortcutModule.exports, window, Event });
   const setTimer = (fn, delay) => { const id = ++timerId; timers.set(id, { fn, delay }); return id; };
-  const context = { module: { exports: {} }, Date: class extends Date { static now() { return now(); } }, require: n => n === 'react-dom' ? { createPortal: children => children } : n === './useFloatingPlayer' ? { __esModule: true, default: () => ({ host: {}, attachSlot() {}, floating, toggle() { floating = !floating; stage.ownerDocument = floating ? popupDocument : document; render(); } }) } : n === 'react' ? react : n === './useDialogKeyboard' ? () => {} : n === '../shortcuts' ? shortcutModule.exports : n === './VideoEnhancement' ? videoEnhancementStub : n === './danmakuSource.mjs' ? { useDanmakuSource: () => 'official', writeDanmakuSource() {} } : n === './OfficialDanmaku' ? { useOfficialDanmaku: ({ preferences, active }) => ({ ...preferences, active }) } : n === './CommentDanmaku' ? { useCommentDanmaku: () => ({ enabled: false, settings: {}, comments: [] }) } : {}, window, document, navigator: {}, crypto: require('node:crypto').webcrypto, setTimeout: setTimer, clearTimeout: id => timers.delete(id), setInterval: setTimer, clearInterval: id => timers.delete(id), requestAnimationFrame: fn => setTimer(fn, 0), cancelAnimationFrame: id => timers.delete(id), console };
+  const context = { module: { exports: {} }, Date: class extends Date { static now() { return now(); } }, require: n => n === '../i18n' ? i18nStub : n === './SoftwareVideo' ? { __esModule: true, default: 'video' } : n === 'react-dom' ? { createPortal: children => children } : n === './useFloatingPlayer' ? { __esModule: true, default: () => ({ host: {}, attachSlot() {}, floating, toggle() { floating = !floating; stage.ownerDocument = floating ? popupDocument : document; render(); } }) } : n === 'react' ? react : n === './useDialogKeyboard' ? () => {} : n === '../shortcuts' ? shortcutModule.exports : n === './VideoEnhancement' ? videoEnhancementStub : n === './danmakuSource.mjs' ? { useDanmakuSource: () => 'official', writeDanmakuSource() {} } : n === './OfficialDanmaku' ? { useOfficialDanmaku: ({ preferences, active }) => ({ ...preferences, active }) } : n === './CommentDanmaku' ? { useCommentDanmaku: () => ({ enabled: false, settings: {}, comments: [] }) } : {}, window, document, navigator: {}, crypto: require('node:crypto').webcrypto, setTimeout: setTimer, clearTimeout: id => timers.delete(id), setInterval: setTimer, clearInterval: id => timers.delete(id), requestAnimationFrame: fn => setTimer(fn, 0), cancelAnimationFrame: id => timers.delete(id), console };
   context.exports = context.module.exports;
   vm.runInNewContext(source, context);
   const nodes = () => { const out = []; const walk = n => { if (!n || typeof n !== 'object') return; out.push(n); n.children?.forEach(walk); }; walk(tree); return out; };
@@ -98,7 +99,7 @@ function mount({ local = false, localIndexes = [], localQuality, saved = null, t
     const video = find(n => n.type === 'video');
     const stageNode = find(n => n.props.className?.split(' ').includes('player-stage'));
     if (stageNode) stageNode.props.ref.current = stage;
-    if (video) { if (video.props.src !== oldSrc || video.props.key !== oldKey) { media.src = video.props.src; media.load(); oldSrc = video.props.src; oldKey = video.props.key; } video.props.ref.current = media; }
+    if (video) { if (video.props.src !== oldSrc || video.props.key !== oldKey) { media.src = video.props.src; media.load(); oldSrc = video.props.src; oldKey = video.props.key; } (video.props.ref || video.props.videoRef).current = media; }
     else for (const slot of slots) if (slot?.current === media) slot.current = null;
     effects.splice(0).forEach(fn => fn()); return tree;
   };

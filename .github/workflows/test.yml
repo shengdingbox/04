@@ -1,4 +1,4 @@
-# 红果短剧 6.2：统一发行前的源码回归检查。
+# 红果短剧 7.0：统一发行前的源码回归检查。
 name: Test
 on:
   push:
@@ -18,4 +18,7 @@ jobs:
       - run: npm ci --no-audit --no-fund
       - name: Install real-media test tools
         run: sudo apt-get update -qq && sudo apt-get install -y -qq ffmpeg
+      # Node fixtures mock Electron; real packaged launches run in the platform workflows.
       - run: npm test
+        env:
+          ELECTRON_OVERRIDE_DIST_PATH: ${{ runner.temp }}/unused-electron

@@ -1,6 +1,16 @@
+<!-- 7.0 release target; current published release remains documented below until publication. -->
+<!-- 6.8 release target. -->
 # 红果短剧
 
-6.2为源码／发行目标：修复观看记录缺失低季被当续作，并将有可见更新的组优先显示。正式版及验证状态见[6.2说明](docs/release-6.2.md)。
+6.8已于2026-11-11 10:17:07（Asia/Shanghai）正式公开并设Latest，内部6.8.0、桌面构建6.8.2，冻结源码`e06828f0c81392fb572a5feda6cec54dba643251`。双Mac、Windows x64、Linux x64 AppImage、Docker amd64统一共25附件，远端大小／SHA256与更新及总校验清单已回读核对。双Mac本轮新签名、公证、装订；Windows EXE未签名，Intel仅Rosetta。未替换本机正式安装。 验证范围见[6.8说明](docs/release-6.8.md)。
+
+6.6已于2026-11-10 21:06:07（Asia/Shanghai）公开并设Latest，内部6.6.0、桌面构建6.6.1，冻结源码`d0410c8ef7b02a087f5c16eb026e0ece61454115`。双Mac、Windows、Linux、Docker与TV共26附件；双Mac新签名/公证/装订，Windows EXE未签名。本轮按用户要求未进行新的功能、界面、播放、安装升级、单元或设备测试；**TV版未测试，请用户自行测试**。不把构建成功或此前开发检查当作实播恢复证明，未替换本机正式安装。 见[6.6说明](docs/release-6.6.md)。
+
+6.5已于2026-11-09 18:50:43（Asia/Shanghai）正式公开并设Latest，内部6.5.0、桌面构建6.5.1，冻结源码`b99555519d97065b16753cd66326eb62894ec34a`。双Mac、Windows、Linux AppImage、Docker五类产物统一发行，25附件远端大小与SHA256、更新清单和精确源码已核对。双Mac签名、公证、装订；Windows播放/安装/升级与Linux真实静音播放、Docker真实下载合并及重启持久化通过；#124实际鼠标唤醒、真实续播、手动暂停和重启记忆通过。Windows EXE未签名，x64 Mac仅Rosetta，未验飞牛硬件；未替换本机正式安装。 见[6.5说明](docs/release-6.5.md)。
+
+6.5功能：Docker Web UI/API、NAS下载与合并，窗口内全屏、重复弹幕聚合及自定义小窗唤醒区域。Docker替代TV，五平台统一发行。状态见docs/release-6.5.md。
+
+6.4已于2026-11-09 00:00:50（Asia/Shanghai）正式公开并设Latest，内部6.4.0、桌面构建6.4.1，冻结源码`12fa10087059be49d8f7d9895bae260130fe0e1f`。本次按明确授权发布双Mac、Windows、Linux四平台，TV继续开发、候选APK不公开；后续默认五平台规则保留。23附件远端大小/SHA256及两份更新清单已核对；双Mac签名、公证、装订与最终DMG/更新ZIP验收通过；Windows真实素材便携播放及安装升级验收通过但EXE未签名；Linux原生Ubuntu CI以CPU软件解码完成两集真实下载与静音播放。Mac两集静音播放及中英文切换、播放器保留、重载记忆通过；x64经Rosetta启动，不等于实体Intel验收。未替换本机正式安装。 详情见[6.4说明](docs/release-6.4.md)。
 
 
 6.1 已于 2026-11-06 13:26（Asia/Shanghai）正式发布，内部 `6.1.0`，标签 `v6.1` 并设为 Latest。冻结源码 `a93793dea2f13864e8a56771bb6bea05ea6ddbb6`；后续文档提交不改变冻结标签和安装包。23份附件远端大小与SHA256逐项一致。 Mac签名/公证/装订，Windows安装升级通过；Linux启动通过、实际播放未验。详见 [6.1说明](docs/release-6.1.md)。
@@ -19,7 +29,7 @@
 
 5.4 已正式发布：恢复播放请求签名，增加官网登录、按剧缓存清理、观看记录分组与 DLNA 单集投屏。发行与验证状态见 [5.4说明](docs/release-5.4.md)。
 
-当前正式版：**6.0**；上一正式版：**5.9**（以下保留历史发行记录）。
+当前正式版：**6.8**；上一正式版：**6.7**（以下保留历史发行记录）。
 
 5.4（内部 `5.4.0`）已于 2026-11-02 18:25（Asia/Shanghai）正式发布，标签 `v5.4`，冻结源码 `e7595c040d328655212a2fb0b315286a6ee914b2`。恢复播放请求签名，增加官网登录、按剧清缓存、观看记录分组与 DLNA 单集投屏。三端16附件远端大小及SHA256匹配；双Mac App与DMG四份Apple公证Accepted、签名/装订、只读挂载与更新ZIP恢复通过。源码CI41425248571、Windows CI41425313110通过232单元及102平台检查；Windows便携11项、安装/重装/真实1.80升级资料保留9项通过，EXE未签名。最终arm64包随机真实两集1080P HEVC/AAC下载和静音约10秒播放通过；x64 Rosetta启动退出通过。
 

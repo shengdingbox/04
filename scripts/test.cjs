@@ -17,6 +17,7 @@ const skip = new Set([
   'check-danmaku-live.cjs',
   'check-linux-media.cjs',
   'check-linux-appimage.cjs',
+  'check-docker-release.cjs',
 ]);
 
 function run(args) {
@@ -34,6 +35,7 @@ const checks = fs.readdirSync(__dirname)
 
 let failed = 0;
 const unitTests = [
+  'src/components/touchHoldSpeed.test.mjs',
   ...fs.readdirSync(path.join(root, 'src/components/__tests__')).filter((name) => name.endsWith('.mjs')).map((name) => path.join('src/components/__tests__', name)),
   ...fs.readdirSync(path.join(root, 'src/native')).filter((name) => name.endsWith('.test.cjs')).map((name) => path.join('src/native', name)),
 ];

@@ -5,6 +5,7 @@ const crypto = require('crypto');
 const { URL } = require('node:url');
 const { normalizeDownloadQuality } = require('./download-quality');
 const { isPublicMediaUrl, webMediaRequestOptions } = require('./web-media-guard');
+const { abortError, throwIfAborted } = require('./request-signal');
 
 const API = "https://api5-normal-sinfonlineb.fqnovel.com";
 const UA = "com.phoenix.read/71532 (Linux; U; Android 9; SM-N9860; Build/PQ3A.190705.10241111;tt-ok/3.12.13.20)";
@@ -86,9 +87,10 @@ const MODEL_BIZ_PARAM = {
 /**
  * API 调用封装
  */
-async function apiCall(apiPath, body, retries = 3, timeout = 25000, deadline = 0) {
+async function apiCall(apiPath, body, retries = 3, timeout = 25000, deadline = 0, requestSignal) {
   const q = { ...COMMON_QUERY, _rticket: Date.now().toString() };
   for (let i = 0; i < retries; i++) {
+    throwIfAborted(requestSignal);
     const remaining = deadline ? deadline - Date.now() : timeout;
     if (remaining <= 0) throw new Error('请求超时');
     const signal = {}; // 供错误信息回溯（HTTP 状态 / 字节数 / CDN logid）
@@ -97,10 +99,12 @@ async function apiCall(apiPath, body, retries = 3, timeout = 25000, deadline = 0
         params: q,
         headers: HEADERS,
         timeout: Math.min(timeout, remaining),
+        signal: requestSignal,
         // 200 + 空 body 时 axios 会解析成 ''，这里统一按原始字节处理便于判断
         responseType: 'arraybuffer',
         transformResponse: [(d) => d],
       });
+      throwIfAborted(requestSignal);
       signal.status = res.status;
       signal.logid = res.headers?.['x-tt-logid'];
       const buf = Buffer.from(res.data || []);
@@ -127,6 +131,8 @@ async function apiCall(apiPath, body, retries = 3, timeout = 25000, deadline = 0
         throw err;
       }
     } catch (err) {
+      throwIfAborted(requestSignal);
+      if (requestSignal && err.code === 'ERR_CANCELED') throw abortError();
       if (i === retries - 1) {
         if (err.detail === undefined) err.detail = signal;
         throw err;
@@ -161,23 +167,50 @@ function markWebMediaFailure(playInfo) {
 }
 
 /** 仅保留短期成功结果；重复点击共享请求，失败后立即允许重试。 */
-async function cachedRequest(key, ttl, load, { force = false } = {}) {
+async function cachedRequest(key, ttl, load, { force = false, signal } = {}) {
+  throwIfAborted(signal);
   const cached = responseCache.get(key);
   if (!force && cached && cached.expires > Date.now()) return cached.value;
   responseCache.delete(key);
-  if (!force && pendingRequests.has(key)) return pendingRequests.get(key);
-  const request = Promise.resolve().then(load).then(value => {
-    // A forced lookup owns the cache even if an older request finishes later.
-    if (pendingRequests.get(key) === request) {
+  let job = !force && pendingRequests.get(key);
+  if (!job) {
+    job = { controller: new AbortController(), consumers: 0, pending: true };
+    job.promise = Promise.resolve().then(() => {
+      throwIfAborted(job.controller.signal);
+      return load(job.controller.signal);
+    });
+    job.promise.then(() => { job.pending = false; }, () => { job.pending = false; });
+    pendingRequests.set(key, job);
+  }
+  job.consumers++;
+  let released = false, abort;
+  const release = () => {
+    if (released) return;
+    released = true;
+    if (--job.consumers === 0) {
+      if (pendingRequests.get(key) === job) pendingRequests.delete(key);
+      if (job.pending) job.controller.abort();
+    }
+  };
+  try {
+    const value = await new Promise((resolve, reject) => {
+      abort = () => { release(); reject(abortError(signal)); };
+      signal?.addEventListener('abort', abort, { once: true });
+      if (signal?.aborted) abort();
+      job.promise.then(resolve, reject);
+    });
+    throwIfAborted(signal);
+    throwIfAborted(job.controller.signal);
+    // Only a live consumer of the newest request may publish a cache entry.
+    if (pendingRequests.get(key) === job) {
       responseCache.set(key, { value, expires: Date.now() + ttl });
       if (responseCache.size > 128) responseCache.delete(responseCache.keys().next().value);
     }
     return value;
-  }).finally(() => {
-    if (pendingRequests.get(key) === request) pendingRequests.delete(key);
-  });
-  pendingRequests.set(key, request);
-  return request;
+  } finally {
+    signal?.removeEventListener('abort', abort);
+    release();
+  }
 }
 
 /** MP4 直链：去掉 HTML 转义并剥掉 Range 头，让 CDN 回整段 */
@@ -192,6 +225,7 @@ function normalizeVideoUrl(raw) {
 
 /** 拉取官网页面 HTML */
 async function fetchSiteHtml(url, timeout = 30000, signal, { trustedOfficialDns = false } = {}) {
+  throwIfAborted(signal);
   let guarded = {};
   if (trustedOfficialDns) {
     try {
@@ -213,6 +247,7 @@ async function fetchSiteHtml(url, timeout = 30000, signal, { trustedOfficialDns 
     maxRedirects: 5,
     signal,
   });
+  throwIfAborted(signal);
   return typeof res.data === 'string' ? res.data : JSON.stringify(res.data);
 }
 
@@ -272,15 +307,17 @@ function parseEpisodeListHtml(html, seriesId) {
  * 因此不需要 spade_a / 解密这一步。
  * sid 已知时用 /player/{sid}/{vid}；未知时退回 /player/_/{vid} 再自行解析。
  */
-async function fetchPlayUrlFromWeb(vid, sid, onFailure) {
+async function fetchPlayUrlFromWeb(vid, sid, onFailure, signal) {
   const candidates = [];
   if (sid) candidates.push(`${SITE_ORIGIN}/player/${encodeURIComponent(sid)}/${encodeURIComponent(vid)}`);
   candidates.push(`${SITE_ORIGIN}/player/_/${encodeURIComponent(vid)}`);
 
   let lastErr = null;
   for (const url of candidates) {
+    throwIfAborted(signal);
     try {
-      const html = await fetchSiteHtml(url, 4000);
+      const html = await fetchSiteHtml(url, 4000, signal);
+      throwIfAborted(signal);
       const router = require('./catalog').readRouterData(html);
       const data = router.loaderData?.['player_(series_id)/(vid)/page'];
       const actualSid = String(data?.series_id || '');
@@ -315,6 +352,8 @@ async function fetchPlayUrlFromWeb(vid, sid, onFailure) {
         return { url: videoUrl.href, spadeA: null, codec: '', source: 'web', vid: String(vid), userAgent: WEB_UA, referer: WEB_REFERER };
       }
     } catch (e) {
+      throwIfAborted(signal);
+      if (signal && e.code === 'ERR_CANCELED') throw abortError();
       lastErr = e;
     }
   }
@@ -363,6 +402,8 @@ function seriesIdFromShareUrl(value) {
 async function resolveSeriesId(shareUrl) {
   if (typeof shareUrl !== 'string' || shareUrl.length > 8192) throw new Error('分享内容无效或过长');
   const trimmed = shareUrl.trim();
+  if (trimmed.startsWith('reelshort:')) return require('./reelshort').resolveSeriesId(trimmed);
+  if (trimmed.startsWith('dramabox:')) return require('./dramabox').resolveSeriesId(trimmed);
   if (trimmed.startsWith('custom:')) {
     if (!/^custom:[a-f\d]{8}-[a-f\d]{4}-[a-f\d]{4}-[a-f\d]{4}-[a-f\d]{12}:\d{1,30}$/i.test(trimmed)) throw new Error('自定义剧集编号无效');
     require('./custom-source').assertEnabled(trimmed);
@@ -376,6 +417,8 @@ async function resolveSeriesId(shareUrl) {
   const link = trimmed.match(linkPattern)?.[0];
   let finalUrl = link ? shareHttpUrl(link.replace(/[),.;!]+$/, '')) : '';
   // Decode URL values separately so encoded digits cannot be truncated by the text matcher.
+  if (finalUrl && new URL(finalUrl).origin === 'https://www.reelshort.com') return require('./reelshort').resolveSeriesId(finalUrl);
+  if (finalUrl && ['https://www.dramabox.com', 'https://www.dramaboxdb.com'].includes(new URL(finalUrl).origin)) return require('./dramabox').resolveSeriesId(finalUrl);
   const initialId = finalUrl ? seriesIdFromShareUrl(finalUrl) : '';
   if (initialId) return initialId;
   if (!finalUrl) throw new Error('请输入有效的 HTTP 或 HTTPS 分享链接，或剧集 ID');
@@ -427,6 +470,8 @@ async function resolveSeriesId(shareUrl) {
  * 获取全集剧集列表
  */
 async function fetchEpisodeList(seriesId, options = {}) {
+  if (String(seriesId).startsWith('dramabox:')) return require('./dramabox').fetchEpisodeList(seriesId, options);
+  if (String(seriesId).startsWith('reelshort:')) return require('./reelshort').fetchEpisodeList(seriesId);
   if (String(seriesId).startsWith('custom:')) return require('./custom-source').fetchEpisodeList(seriesId);
   if (String(seriesId).startsWith('hema:')) return require('./hema').fetchEpisodeList(seriesId);
   if (String(seriesId).startsWith('xifan:')) return require('./xifan').fetchEpisodeList(seriesId);
@@ -620,23 +665,32 @@ function parseModelVideo(vm) {
  */
 async function fetchPlayUrlSingle(vid, sid, options = {}) {
   try {
+    throwIfAborted(options.signal);
     const quality = normalizeDownloadQuality(options.quality);
+    if (String(vid).startsWith('reelshort:') || String(sid).startsWith('reelshort:')) return require('./reelshort').fetchPlayUrlSingle(vid, sid);
+    if (String(vid).startsWith('dramabox:') || String(sid).startsWith('dramabox:')) return require('./dramabox').fetchPlayUrlSingle(vid, sid, options);
     if (String(vid).startsWith('custom:') || String(sid).startsWith('custom:')) return require('./custom-source').fetchPlayUrlSingle(vid, sid, options);
     if (String(vid).startsWith('hema:') || String(sid).startsWith('hema:')) return require('./hema').fetchPlayUrlSingle(vid, sid);
     if (String(vid).startsWith('xifan:') || String(sid).startsWith('xifan:')) return require('./xifan').fetchPlayUrlSingle(vid, sid);
     const skipWeb = (failedWebMedia.get(String(vid)) || 0) > Date.now();
     const allowLowerQuality = options.allowLowerQuality === true && quality !== 'auto';
     const cacheKey = `play:${sid || ''}:${vid}${quality === 'auto' ? '' : `:${quality}`}${skipWeb ? ':fallback' : ''}${allowLowerQuality ? ':lower-quality' : ''}`;
-    const result = await cachedRequest(cacheKey, 30000, () => quality === 'auto'
-      ? fetchPlayUrlFresh(vid, sid, skipWeb)
-      : require('./app-source').fetchAppPlayUrl(String(vid), { quality, allowLowerQuality }).catch(error => {
+    const result = await cachedRequest(cacheKey, 30000, signal => quality === 'auto'
+      ? fetchPlayUrlFresh(vid, sid, skipWeb, signal)
+      : require('./app-source').fetchAppPlayUrl(String(vid), { quality, allowLowerQuality, signal }).catch(error => {
+        throwIfAborted(signal);
+        if (error.code === 'ERR_CANCELED') throw error;
         throw unavailableSources([sourceFailure('app', error)], allowLowerQuality ? 'auto' : quality);
       }), options);
+    throwIfAborted(options.signal);
     // Last-resort web recovery must not replace App priority during the penalty window.
     if (skipWeb && result.source === 'web' && responseCache.get(cacheKey)?.value === result) responseCache.delete(cacheKey);
     return result;
   } catch (error) {
+    if (options.signal?.aborted) error = abortError(options.signal);
+    if (error.code === 'ERR_CANCELED') return { url: null, spadeA: null, codec: null, error: '已取消 App 片源请求', code: 'ERR_CANCELED' };
     return { url: null, spadeA: null, codec: null, error: error.message,
+      ...(error.code === 'ETIMEDOUT' ? { code: error.code } : {}),
       ...(error.code === 'SOURCE_UNAVAILABLE' ? { code: error.code, sources: error.sources } : {}) };
   }
 }
@@ -644,24 +698,31 @@ async function fetchPlayUrlSingle(vid, sid, options = {}) {
 function sourceFailure(source, error) {
   const message = String(error?.message || '');
   const code = String(error?.code || '');
+  if (code === 'ERR_CANCELED') return { source, code, message: '已取消 App 片源请求' };
+  const networkDetails = { DNS: 'DNS 解析失败', CONNECTION: '连接失败', TLS: 'TLS 证书或握手失败' };
+  const network = typeof error?.networkFailure === 'string' && Object.hasOwn(networkDetails, error.networkFailure)
+    ? { networkFailure: error.networkFailure } : {};
   if (code === 'DEVICE_REGISTRATION_FAILED') {
     const reason = String(error.registrationFailure || '');
     const descriptions = { TIMEOUT: '请求超时', NETWORK_ERROR: '网络连接失败', EMPTY_RESPONSE: '上游返回空响应',
       INVALID_RESPONSE: '上游未返回有效设备编号', BUSINESS_REJECTED: '上游拒绝注册', SECURITY_BLOCKED: '注册请求被安全校验阻止' };
-    const detail = Object.hasOwn(descriptions, reason) ? descriptions[reason]
+    const detail = reason === 'NETWORK_ERROR' && network.networkFailure ? networkDetails[network.networkFailure]
+      : Object.hasOwn(descriptions, reason) ? descriptions[reason]
       : /^HTTP_[3-5]\d{2}$/.test(reason) ? `HTTP ${reason.slice(5)}` : '';
     const transient = /^(?:TIMEOUT|NETWORK_ERROR|HTTP_(?:408|5\d\d))$/.test(reason);
     return { source, code: /^(?:TIMEOUT|NETWORK_ERROR|HTTP_[3-5]\d{2})$/.test(reason) ? reason : code,
+      ...(reason === 'NETWORK_ERROR' ? network : {}),
       message: `匿名播放设备注册失败${detail ? `（${detail}）` : ''}${transient ? '，请检查网络，10 秒后重试' : '；本机冷却 10 秒后可手动重试，上游何时恢复暂无法确认'}` };
   }
   const status = Number(error?.status || error?.response?.status || message.match(/HTTP\s+(\d{3})/)?.[1]);
   if (status >= 300 && status <= 599) return { source, code: `HTTP_${status}`, message: `请求失败（HTTP ${status}）` };
   if (code === 'SECURITY_BLOCKED' || code.startsWith('ERR_WEB_MEDIA_')) return { source, code: 'SECURITY_BLOCKED', message: '片源地址被安全校验阻止' };
   if (code === 'EMPTY_RESPONSE' || error?.emptyResponse || /接口返回空响应/.test(message)) {
-    return { source, code: 'EMPTY_RESPONSE', message: '播放接口空响应，可能是签名或设备鉴权问题' };
+    return { source, code: 'EMPTY_RESPONSE', message: '播放接口返回空响应，原因尚未确认' };
   }
   if (['ECONNABORTED', 'ETIMEDOUT', 'TIMEOUT'].includes(code) || /超时|timeout/i.test(message)) return { source, code: 'TIMEOUT', message: '请求超时' };
-  if (['ENOTFOUND', 'EAI_AGAIN', 'ECONNRESET', 'ECONNREFUSED', 'EHOSTUNREACH', 'ENETUNREACH', 'EPIPE', 'ERR_NETWORK', 'ERR_CANCELED'].includes(code)) return { source, code: 'NETWORK_ERROR', message: '网络连接失败，请稍后重试' };
+  if (network.networkFailure || ['ENOTFOUND', 'EAI_AGAIN', 'ECONNRESET', 'ECONNREFUSED', 'EHOSTUNREACH', 'ENETUNREACH', 'EPIPE', 'ERR_NETWORK'].includes(code)) return { source, code: 'NETWORK_ERROR', ...network,
+    message: network.networkFailure ? `${networkDetails[network.networkFailure]}，请稍后重试` : '网络连接失败，请稍后重试' };
   if (code === 'PREVIEW_ONLY') return { source, code, message: '网页仅提供预览，未作为完整片源' };
   if (code === 'QUALITY_UNAVAILABLE') return { source, code, message: ['720p', '1080p'].includes(error?.quality)
     ? `本集暂无尺寸可确认且满足 ${error.quality} 的 H.264/HEVC 片源，未降级` : '未取得满足所选清晰度的片源，未降级' };
@@ -680,14 +741,20 @@ function unavailableSources(sources, quality = 'auto') {
   return error;
 }
 
-async function fetchPlayUrlFresh(vid, sid, skipWeb = false) {
+async function fetchPlayUrlFresh(vid, sid, skipWeb = false, signal) {
+  throwIfAborted(signal);
   const sources = [];
-  const web = !skipWeb && await fetchPlayUrlFromWeb(vid, sid, error => sources.push(sourceFailure('web', error)));
+  const web = !skipWeb && await fetchPlayUrlFromWeb(vid, sid, error => sources.push(sourceFailure('web', error)), signal);
+  throwIfAborted(signal);
   if (web && web.url) return web;
 
   try {
-    return await require('./app-source').fetchAppPlayUrl(String(vid));
+    const result = await require('./app-source').fetchAppPlayUrl(String(vid), { signal });
+    throwIfAborted(signal);
+    return result;
   } catch (error) {
+    throwIfAborted(signal);
+    if (error.code === 'ERR_CANCELED') throw error;
     sources.push(sourceFailure('app', error));
   }
 
@@ -697,17 +764,21 @@ async function fetchPlayUrlFresh(vid, sid, skipWeb = false) {
     mixed_video_id_map: { "1004": [vid] },
   };
   try {
-    const j = await apiCall("/novel/player/multi_video_model/preload/v1", body, 1, 6000);
+    const j = await apiCall("/novel/player/multi_video_model/preload/v1", body, 1, 6000, 0, signal);
+    throwIfAborted(signal);
     const item = j?.data?.[vid] || {};
     const [url, spadeA, codec] = parseModelVideo(item.video_model);
     if (url) return { url, spadeA, codec, source: 'api', vid: String(vid), userAgent: UA };
     sources.push(sourceFailure('api'));
   } catch (e) {
+    throwIfAborted(signal);
+    if (e.code === 'ERR_CANCELED') throw e;
     sources.push(sourceFailure('api', e));
   }
   // A transient CDN failure changes priority, not permanent source availability.
   if (skipWeb) {
-    const lastWeb = await fetchPlayUrlFromWeb(vid, sid, error => sources.push(sourceFailure('web', error)));
+    const lastWeb = await fetchPlayUrlFromWeb(vid, sid, error => sources.push(sourceFailure('web', error)), signal);
+    throwIfAborted(signal);
     if (lastWeb?.url) return lastWeb;
   }
   throw unavailableSources(sources);
@@ -976,7 +1047,7 @@ function rebuildMoov(data, moovOff, moovSize, top) {
       const nc = data.readUInt32BE(b.off + 12);
       for (let i = 0; i < nc; i++) {
         const v = data.readUInt32BE(b.off + 16 + i * 4);
-        if (v >= delta) {
+        if (v >= moovOff + moovSize) {
           data.writeUInt32BE(v - delta, b.off + 16 + i * 4);
         }
       }

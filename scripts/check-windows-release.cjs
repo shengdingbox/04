@@ -14,7 +14,7 @@ const profile = path.join(temp, 'profile');
 fs.mkdirSync(out, { recursive: true });
 fs.mkdirSync(profile);
 const skipPlayback = process.argv.includes('--skip-playback');
-const result = { version: pkg.version, hostPlatform: process.platform, hostArch: process.arch, signed: false, playbackTested: false, checks: [] };
+const result = { version: pkg.version, sourceCommit: process.env.GITHUB_SHA, hostPlatform: process.platform, hostArch: process.arch, signed: false, playbackTested: false, checks: [] };
 let child, socket, seq = 0;
 const pending = new Map();
 const delay = ms => new Promise(resolve => setTimeout(resolve, ms));
@@ -115,18 +115,27 @@ async function realFootage(mediaDir, ffmpeg) {
   const start = Math.floor(Math.random() * Math.min(10, series.episodes.length - 1));
   const episodes = series.episodes.slice(start, start + 2), samples = [];
   for (const [index, episode] of episodes.entries()) {
-    const info = await native.fetchPlayUrlSingle(episode.vid, series.series_id, { force: true });
-    assert(info.url, 'Real Hongguo episode source unavailable; do not substitute footage');
+    const info = await native.fetchPlayUrlSingle(episode.vid, series.series_id, { force: true, quality: '1080p' });
+    assert(info.url, 'Real Hongguo episode source unavailable: ' + JSON.stringify(info.sources?.map(({source,code}) => ({source,code}))));
     const encrypted = path.join(mediaDir, `original-${index}.mp4`);
     try {
-      const response = await require('axios').get(info.url, {
-        ...require('../src/native/web-media-guard').webMediaRequestOptions(info.url),
-        headers: { 'User-Agent': info.userAgent || native.UA, Referer: native.VIDEO_REFERER },
+      const config = {
+        ...(info.source === 'web' ? require('../src/native/web-media-guard').webMediaRequestOptions(info.url) : {}),
+        headers: { 'User-Agent': info.userAgent || native.UA, 'Accept-Encoding': 'identity',
+          ...((info.referer || info.source === 'web') ? { Referer: info.referer || native.WEB_REFERER } : {}) },
         responseType: 'arraybuffer', timeout: 60000, maxContentLength: 128 * 1024 * 1024,
-      });
+      };
+      let response;
+      try { response = await require('axios').get(info.url, config); }
+      catch (error) {
+        if (info.source !== 'app' || error.response?.status !== 403) throw error;
+        // Match the application's bounded CDN Referer fallback.
+        config.headers.Referer = native.VIDEO_REFERER;
+        response = await require('axios').get(info.url, config);
+      }
       assert(response.data.byteLength > 0);
       fs.writeFileSync(encrypted, response.data);
-    } catch (_) { throw new Error('Real Hongguo acceptance video download failed; no media URL logged'); }
+    } catch (error) { throw new Error('Real Hongguo acceptance download failed (' + (Number(error.response?.status) || error.code || 'unknown') + '); no media URL logged'); }
     const sample = path.join(mediaDir, `windows-sample-${index + 1}.mp4`);
     const key = info.contentKey || (info.spadeA ? native.deriveKey(info.spadeA)?.toString('hex') : '');
     const decoded = spawnSync(ffmpeg, ['-y', '-v', 'error', ...(key ? ['-decryption_key', key] : []),
@@ -255,6 +264,16 @@ async function realFootage(mediaDir, ffmpeg) {
   }
   const info = await evaluate('window.electronAPI.getAppInfo()');
   assert.equal(info.version, pkg.version); assert.equal(info.platform, 'win32');
+  assert.equal(await evaluate('document.title'), /^zh/i.test(info.systemLocale) ? '红果短剧' : 'Hongguo Drama');
+  await evaluate(`(async () => {
+    localStorage.setItem('hongguo:language', 'zh-CN');
+    window.dispatchEvent(new StorageEvent('storage', { key: 'hongguo:language' }));
+    const deadline = Date.now() + 5000;
+    while (document.documentElement.lang !== 'zh-CN') {
+      if (Date.now() > deadline) throw Error('Interface language did not switch');
+      await new Promise(resolve => setTimeout(resolve, 25));
+    }
+  })()`);
   const settings = await evaluate('window.electronAPI.getSettings()');
   assert.equal(settings.root, mediaDir, 'Temporary profile must isolate all user state');
   assert.deepEqual(await evaluate('window.electronAPI.getAnnouncementPreferences()'), { normalEnabled: false, emergencyEnabled: false }, 'Disposable playback profile must opt out of remote notices');
@@ -467,6 +486,39 @@ async function realFootage(mediaDir, ffmpeg) {
   assert(await evaluate('getComputedStyle(document.querySelector(".player-controls")).opacity === "1"'), 'Returning to the ordinary landscape player must restore controls');
   result.fullscreenControls = { idleHidden: true, pointerRestores: true, pausedVisible: true, resumedHidden: true, landscapeIdleHidden: true, landscapePointerLeave: pointerLeave, landscapePointerReturnRestores: true };
   result.checks.push('Actual single-file EXE: fullscreen and ordinary landscape idle hide controls; landscape pointer leave hides within one second and return restores; pause keeps visible; resume hides');
+  result.realMedia.playbackStates = [];
+  for (const [index, episode] of episodes.data.episodes.slice(0, 2).entries()) {
+    result.stage = `ten-second-real-playback-${index + 1}`;
+    assert.equal((await evaluate(`window.electronAPI.playSeries({seriesId:${JSON.stringify(sid)}, vidIndex:${index + 1}})`)).success, true);
+    const state = await evaluate(`(async () => {
+      const expected = ${JSON.stringify(episode.fileUrl)};
+      const deadline = performance.now() + 18000;
+      let started = false;
+      while (performance.now() < deadline) {
+        const video = document.querySelector('video');
+        if (video?.currentSrc === expected && video.readyState >= 2) {
+          video.muted = true; video.volume = 0;
+          if (!started) {
+            video.currentTime = 0;
+            await video.play();
+            started = true;
+          } else if (video.currentTime >= 10) {
+            video.pause();
+            return { time: video.currentTime, muted: video.muted, volume: video.volume,
+              paused: video.paused, error: video.error?.message || null,
+              width: video.videoWidth, height: video.videoHeight };
+          }
+        }
+        await new Promise(resolve => setTimeout(resolve, 100));
+      }
+      throw new Error('Actual episode did not play for ten seconds');
+    })()`);
+    assert(state.time >= 10 && state.muted && state.volume === 0 && state.paused && !state.error
+      && state.width > 0 && state.height > 0, JSON.stringify(state));
+    result.realMedia.playbackStates.push({ index: result.realMedia.episodes[index].index, ...state });
+  }
+  delete result.stage;
+  result.checks.push('Both real episodes advance at least ten seconds in the actual portable player, muted with zero volume, then pause without media errors');
   result.playbackTested = true;
   result.passed = true;
   console.log('Windows release smoke: PASS (' + result.checks.length + ' checks)');

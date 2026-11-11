@@ -1,3 +1,4 @@
+// 红果短剧 7.0：版本及发行状态见 package.json 和 docs/release-7.0.md。
 // 红果短剧 6.2：桌面桥接入口，发行说明见 docs/release-6.0.md。
 const { contextBridge, ipcRenderer } = require('electron');
 
@@ -19,6 +20,7 @@ contextBridge.exposeInMainWorld('electronAPI', {
     return () => ipcRenderer.removeListener('text-export-done', listener);
   },
   setStealthMode: enabled => ipcRenderer.invoke('set-stealth-mode', enabled),
+  setFloatingPlayerAspectRatio: (width, height) => ipcRenderer.send('floating-player-aspect-ratio', { width, height }),
   getBossKeyState: () => ipcRenderer.invoke('get-boss-key-state'),
   setBossKey: value => ipcRenderer.invoke('set-boss-key', value),
   onBossKeyState: cb => {
@@ -60,6 +62,7 @@ contextBridge.exposeInMainWorld('electronAPI', {
     return () => ipcRenderer.removeListener('app-update-preference', listener);
   },
   getAppInfo: () => ipcRenderer.invoke('get-app-info'),
+  setInterfaceLanguage: language => ipcRenderer.invoke('set-interface-language', language),
   openExternalUrl: (url) => ipcRenderer.invoke('open-external-url', url),
 
 
